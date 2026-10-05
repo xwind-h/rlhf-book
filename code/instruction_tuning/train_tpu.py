@@ -1,5 +1,10 @@
 """Data-parallel SFT on all cores of a single TPU VM (including v5e-8).
 
+On single-chip v5e-1, pass --no-spawn to run the worker directly in this
+process instead of torch_xla.launch: one chip needs no multiprocess
+rendezvous, and the spawn path is what trips the libtpu slice-builder
+"Expected 4 worker addresses, got 1" init failure.
+
 Requires matching PyTorch and torch_xla[tpu] versions (PyTorch/XLA 2.8+).
 On the Linux TPU VM, run from code/ and prepare a separate environment outside
 the checkout. For example, use this matching PyTorch/XLA 2.8 pair:
@@ -8,9 +13,17 @@ the checkout. For example, use this matching PyTorch/XLA 2.8 pair:
     uv venv "$TPU_ENV" --python 3.12
     uv pip install --python "$TPU_ENV/bin/python" \
         --index-url https://download.pytorch.org/whl/cpu "torch==2.8.0"
-    uv pip install --python "$TPU_ENV/bin/python" "torch_xla[tpu]==2.8.0" \
+    uv pip install --python "$TPU_ENV/bin/python" \
+        --find-links https://storage.googleapis.com/libtpu-releases/index.html \
+        "torch_xla[tpu]==2.8.0" \
         "transformers[chat-template]==4.57.5" "datasets>=2.19" \
         "pydantic>=2" pyyaml wandb rich numpy
+
+The --find-links entry is load-bearing: without it pip resolves libtpu
+from PyPI instead of the matching libtpu release, which surfaces as
+"TPU initialization failed: Invalid --2a886c8_slice_builder_worker_addresses
+specified. Expected 4 worker addresses, got 1." Verify the trio matches
+with `"$TPU_ENV/bin/pip" show torch torch-xla libtpu` before launching.
 
 Explicitly select that environment when launching. Do not run uv sync in it:
 the project's normal Linux setup installs CUDA PyTorch, not this TPU pair.
@@ -27,6 +40,31 @@ gradient_accumulation_steps: 4, and sample_every: 0. Then run:
     UV_PROJECT_ENVIRONMENT="$TPU_ENV" PJRT_DEVICE=TPU \
         uv run --no-sync python -m instruction_tuning.train_tpu \
         --config instruction_tuning/configs/sft_olmo2_1b_tpu.yaml
+
+If spawn still fails under the uv wrapper, bypass it with the venv
+interpreter directly (same environment, fewer moving parts):
+
+    PJRT_DEVICE=TPU "$TPU_ENV/bin/python" -m instruction_tuning.train_tpu \
+        --config instruction_tuning/configs/sft_olmo2_1b_tpu.yaml
+
+On single-chip v5e-1, append --no-spawn to either command above. The
+effective batch is then batch_size x gradient_accumulation_steps x 1,
+and the single 16 GB chip needs headroom: start from batch_size: 1,
+max_length: 1024 as above and shrink further if XLA reports OOM.
+
+If you hit "Invalid --2a886c8_slice_builder_worker_addresses specified.
+Expected 4 worker addresses, got 1", work through these on the TPU VM
+before re-running: (1) reinstall with the --find-links libtpu index
+above; (2) single-process probe `PJRT_DEVICE=TPU "$TPU_ENV/bin/python"
+-c "import torch_xla.core.xla_model as xm;
+print(xm.get_xla_supported_devices())"` -- on v5e-8 expect 8 xla devices,
+on v4-8/v3-8 expect 8; if the probe alone fails, the issue is the
+environment, not this script; (3) `env | grep -E 'TPU|PJRT|XLA|CLOUD'`
+and unset stale TPU_PROCESS_ADDRESSES, TPU_VISIBLE_CHIPS,
+TPU_NUM_DEVICES, or JAX_USE_PJRT_C_API_ON_TPU overrides; (4) confirm
+the VM shape (`gcloud compute tpus tpu-vm describe ...`) is single-host
+v5e-8, since torch_xla.launch auto-sizes to one host and multi-host
+slices need one launch per host.
 
 batch_size is per core; the global effective batch also includes the core count.
 Each core stores a full model and optimizer, so v5e-8 does not pool its eight
@@ -274,7 +312,7 @@ def _train_worker(index: int, cfg: Config):
             wandb.finish()
 
 
-def main(cfg: Config):
+def main(cfg: Config, spawn: bool = True):
     if cfg.batch_size < 1 or cfg.gradient_accumulation_steps < 1 or cfg.num_epochs < 1:
         raise ValueError(
             "batch_size, gradient_accumulation_steps, and num_epochs must be positive."
@@ -284,12 +322,31 @@ def main(cfg: Config):
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     if os.environ["PJRT_DEVICE"] != "TPU":
         raise ValueError("Set PJRT_DEVICE=TPU to run this script.")
+    if not spawn:
+        # Single-chip VMs (e.g. v5e-1): run in-process, no multiprocess init.
+        _train_worker(0, cfg)
+        return
     try:
         import torch_xla
     except ImportError as exc:
         raise RuntimeError(
             "Install matching PyTorch and torch_xla[tpu] versions (PyTorch/XLA 2.8+) on the TPU VM."
         ) from exc
+    # Stale sharding overrides are the usual source of
+    # "Expected 4 worker addresses, got 1": launch auto-sizes to the host.
+    for _var in (
+        "TPU_PROCESS_ADDRESSES",
+        "TPU_VISIBLE_CHIPS",
+        "TPU_NUM_DEVICES",
+        "CLOUD_TPU_TASK_ID",
+        "JAX_USE_PJRT_C_API_ON_TPU",
+    ):
+        if os.environ.get(_var):
+            console.print(
+                f"[yellow]Ignoring {_var}={os.environ[_var]!r}: "
+                "unset it so torch_xla.launch can size the single-host slice.[/yellow]"
+            )
+            del os.environ[_var]
     # Do not request a device in this parent process; launch discovers all cores.
     torch_xla.launch(_train_worker, args=(cfg,), start_method="spawn")
 
@@ -305,8 +362,13 @@ def main_cli():
         default="tpu",
         help="Always uses TPU; YAML device/model_device_id are ignored",
     )
+    parser.add_argument(
+        "--no-spawn",
+        action="store_true",
+        help="Run the worker directly in this process (use on single-chip v5e-1)",
+    )
     args = parser.parse_args()
-    main(load_config(args.config))
+    main(load_config(args.config), spawn=not args.no_spawn)
 
 
 if __name__ == "__main__":

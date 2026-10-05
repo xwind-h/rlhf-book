@@ -310,6 +310,41 @@ def test_main_launches_workers_without_initializing_parent_device(monkeypatch):
     assert launches == [(train._train_worker, (cfg,), "spawn")]
 
 
+def test_main_no_spawn_runs_worker_in_process(monkeypatch):
+    train = _tpu_train()
+    xla = ModuleType("torch_xla")
+    launches = []
+    xla.launch = lambda fn, args, start_method: launches.append((fn, args, start_method))
+    monkeypatch.setitem(sys.modules, "torch_xla", xla)
+    monkeypatch.delenv("PJRT_DEVICE", raising=False)
+    calls = []
+    monkeypatch.setattr(train, "_train_worker", lambda index, cfg: calls.append((index, cfg)))
+    cfg = Config()
+
+    train.main(cfg, spawn=False)
+
+    assert calls == [(0, cfg)]
+    assert launches == []
+    assert os.environ["PJRT_DEVICE"] == "TPU"
+
+
+def test_main_clears_stale_tpu_sharding_overrides(monkeypatch):
+    train = _tpu_train()
+    xla = ModuleType("torch_xla")
+    launches = []
+    xla.launch = lambda fn, args, start_method: launches.append((fn, args, start_method))
+    monkeypatch.setitem(sys.modules, "torch_xla", xla)
+    monkeypatch.delenv("PJRT_DEVICE", raising=False)
+    monkeypatch.setenv("TPU_PROCESS_ADDRESSES", "localhost:12345")
+    monkeypatch.setenv("TPU_VISIBLE_CHIPS", "0")
+
+    train.main(Config())
+
+    assert "TPU_PROCESS_ADDRESSES" not in os.environ
+    assert "TPU_VISIBLE_CHIPS" not in os.environ
+    assert len(launches) == 1
+
+
 @pytest.mark.parametrize(
     "changes",
     [
