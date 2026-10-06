@@ -5,6 +5,8 @@ On release, entries get moved under a version heading.
 
 ## Unreleased
 
+- 2026-10-06: Split TPU SFT into `instruction_tuning.train_tpu` for single-chip training without spawn or collectives and `instruction_tuning.train_tpu_parallel` for data parallelism on a multi-chip TPU VM, sharing model loading and static-shape collation. Removed `--no-spawn`; existing multi-chip commands must switch to `train_tpu_parallel`. Effective batch still scales with worker count; updated setup documentation and CPU regression tests.
+
 - 2026-10-06: Fixed the TPU SFT launcher (`instruction_tuning/train_tpu.py`) for single-chip VMs such as v5e-1 by adding a `--no-spawn` flag that runs the worker directly instead of `torch_xla.launch`, avoiding the libtpu slice-builder "Expected 4 worker addresses, got 1" init failure; also corrected the install docs to use the libtpu release index (`--find-links https://storage.googleapis.com/libtpu-releases/index.html`) and to clear stale `TPU_*` sharding overrides before launch, plus regression tests.
 
 - 2026-09-02: [PR #528](https://github.com/natolambert/rlhf-book/pull/528) corrected the ratio direction in the k1 and k3 estimators so they estimate `KL(pi || pi_ref)` for samples drawn from the policy, and added directional regression coverage. This changes KL metrics and reward-penalty semantics for configurations with `beta > 0`; checked-in defaults with `beta: 0.0` are unaffected.

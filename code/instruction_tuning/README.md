@@ -79,6 +79,94 @@ WANDB_PROJECT=rlhf-book uv run python -m instruction_tuning.train \
     --config instruction_tuning/configs/sft_olmo2_1b.yaml
 ```
 
+## TPU Training
+
+The TPU entrypoints are separate:
+
+- `train_tpu.py`: one process on a single-chip VM such as v5e-1, with no
+  worker spawning, rendezvous, or gradient collectives.
+- `train_tpu_parallel.py`: data-parallel workers on all cores of one
+  multi-chip TPU VM such as v5e-8. Each worker receives a separate dataset
+  shard; gradients are averaged before clipping, and only rank zero logs
+  and generates samples.
+
+The former `train_tpu --no-spawn` command becomes `train_tpu` with no flag.
+Existing multi-chip commands must use `train_tpu_parallel` instead.
+Both entrypoints ignore YAML `device`/`model_device_id` and require the TPU
+runtime. The single-chip entrypoint rejects a runtime with multiple workers.
+
+On the Linux TPU VM, run from `code/` and prepare a separate environment
+outside the checkout. Use matching PyTorch and PyTorch/XLA versions (2.8+);
+the existing 2.8 setup is:
+
+```bash
+TPU_ENV="$HOME/.venvs/rlhf-book-tpu"
+uv venv "$TPU_ENV" --python 3.12
+uv pip install --python "$TPU_ENV/bin/python" \
+    --index-url https://download.pytorch.org/whl/cpu "torch==2.8.0"
+uv pip install --python "$TPU_ENV/bin/python" \
+    --find-links https://storage.googleapis.com/libtpu-releases/index.html \
+    "torch_xla[tpu]==2.8.0" \
+    "transformers[chat-template]==4.57.5" "datasets>=2.19" \
+    "pydantic>=2" pyyaml wandb rich numpy
+uv pip show --python "$TPU_ENV/bin/python" torch torch-xla libtpu
+
+cp -n instruction_tuning/configs/sft_olmo2_1b.yaml \
+    instruction_tuning/configs/sft_olmo2_1b_tpu.yaml
+```
+
+Keep the `--find-links` libtpu release index when installing the matching
+versions. Do not run `uv sync` in this TPU environment: the project's normal
+Linux setup installs CUDA PyTorch. Launch with `--no-sync` to preserve the
+manually installed versions.
+
+Before launching, edit the copied config to use `batch_size: 1`,
+`max_length: 1024`, `gradient_accumulation_steps: 4`, and `sample_every: 0`.
+This is a starting point for memory headroom; verify it on the actual VM and
+reduce batch size or sequence length further if XLA reports OOM.
+
+```bash
+# Single chip (e.g. v5e-1)
+UV_PROJECT_ENVIRONMENT="$TPU_ENV" PJRT_DEVICE=TPU \
+    uv run --no-sync python -m instruction_tuning.train_tpu \
+    --config instruction_tuning/configs/sft_olmo2_1b_tpu.yaml
+
+# Multiple chips on one VM (e.g. v5e-8)
+UV_PROJECT_ENVIRONMENT="$TPU_ENV" PJRT_DEVICE=TPU \
+    uv run --no-sync python -m instruction_tuning.train_tpu_parallel \
+    --config instruction_tuning/configs/sft_olmo2_1b_tpu.yaml
+```
+
+Run one training job at a time. For long runs, launch in the background with
+output redirected to a log and monitor that log for the first metrics or a
+failure.
+
+`batch_size` is per worker. Effective batch size is
+`batch_size × gradient_accumulation_steps` for a single chip, and additionally
+multiplied by the worker count for parallel training. The settings above give
+an effective batch of 4 on one worker or 32 on eight workers. Each parallel
+worker stores a full model and optimizer; v5e-8 does not pool its eight 16 GB
+memories. Both versions pad sequences to `max_length` for static XLA shapes
+and drop incomplete batches and trailing partial accumulation windows.
+`sample_every: 0` avoids slow autoregressive-generation compilations.
+
+If initialization fails with `Expected 4 worker addresses, got 1`, first
+check the installed torch/torch-xla/libtpu versions and the release index
+above. Test the runtime independently of the training script:
+
+```bash
+UV_PROJECT_ENVIRONMENT="$TPU_ENV" PJRT_DEVICE=TPU \
+    uv run --no-sync python -c \
+    'import torch_xla.core.xla_model as xm; print(xm.get_xla_supported_devices())'
+```
+
+If this probe fails, fix the TPU environment first. Check for stale
+`TPU_PROCESS_ADDRESSES`, `TPU_VISIBLE_CHIPS`, `TPU_NUM_DEVICES`,
+`CLOUD_TPU_TASK_ID`, or `JAX_USE_PJRT_C_API_ON_TPU` overrides. The parallel
+entrypoint clears these overrides so `torch_xla.launch` can discover the
+single-host topology, without initializing a device in the parent process.
+This example targets one TPU VM; it does not coordinate multi-host slices.
+
 ## What Happens
 
 1. Load `allenai/OLMo-2-0425-1B` (base) and its tokenizer. The base tokenizer
@@ -145,6 +233,8 @@ instruction_tuning/
 ├── README.md      # this file
 ├── config.py      # pydantic Config + YAML loader
 ├── train.py       # SFT loop with in-loop sample logging
+├── train_tpu.py   # single-chip TPU SFT + shared TPU model/collation helpers
+├── train_tpu_parallel.py # data-parallel SFT on one multi-chip TPU VM
 ├── utils.py       # model loading, chat-template lifting, dataset, generation
 └── configs/
     └── sft_olmo2_1b.yaml

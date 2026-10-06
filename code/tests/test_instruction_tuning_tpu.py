@@ -18,8 +18,8 @@ from transformers import AutoModelForCausalLM, LlamaConfig, PreTrainedTokenizerF
 from instruction_tuning.config import Config
 
 
-def _tpu_train():
-    name = "instruction_tuning.train_tpu"
+def _tpu_train(parallel=False):
+    name = "instruction_tuning.train_tpu_parallel" if parallel else "instruction_tuning.train_tpu"
     assert importlib.util.find_spec(name) is not None, "TPU training module is not implemented"
     return importlib.import_module(name)
 
@@ -48,7 +48,7 @@ def test_collate_rejects_rows_longer_than_static_shape():
 
 
 def test_eight_workers_receive_disjoint_full_batches(monkeypatch):
-    tpu_train = _tpu_train()
+    tpu_train = _tpu_train(parallel=True)
     rows = [
         {"input_ids": torch.tensor([i, i]), "labels": torch.tensor([-100, i])} for i in range(40)
     ]
@@ -139,15 +139,14 @@ class TinyLM(torch.nn.Module):
         return SimpleNamespace(logits=input_ids.unsqueeze(-1).float() * self.weights)
 
 
-def _cpu_worker(monkeypatch, rank=0, remote_finite=True, row_count=2, **changes):
+def _cpu_worker(monkeypatch, rank=0, remote_finite=True, row_count=2, parallel=True, **changes):
     """Replace only TPU collectives and external I/O; train with real CPU autograd.
 
     The simulated second worker trains on input 2 with target 1, while this
     worker trains on input 10 with target 0. Averaging before clipping matters:
     at initialization their gradients are [-5, 5] and [1, -1].
     """
-    train = _tpu_train()
-    assert callable(getattr(train, "_train_worker", None)), "TPU worker is not implemented"
+    train = _tpu_train(parallel=parallel)
     cfg = Config(
         **{
             "batch_size": 1,
@@ -175,6 +174,7 @@ def _cpu_worker(monkeypatch, rank=0, remote_finite=True, row_count=2, **changes)
     )
 
     def all_reduce(reduction, value, scale=1.0):
+        assert parallel, "Single-chip training must not use collectives"
         if reduction == "min":
             finite = bool(value.item()) and remote_finite
             if finite:
@@ -194,7 +194,12 @@ def _cpu_worker(monkeypatch, rank=0, remote_finite=True, row_count=2, **changes)
         return result
 
     def reduce_gradients(optimizer):
+        assert parallel, "Single-chip training must not reduce gradients"
         model.weights.grad.add_(state.remote_grad).div_(2)
+
+    def rendezvous(tag):
+        assert parallel, "Single-chip training must not enter rendezvous"
+        state.barriers.append(tag)
 
     xla, core, xm, runtime = (
         ModuleType(name)
@@ -205,11 +210,11 @@ def _cpu_worker(monkeypatch, rank=0, remote_finite=True, row_count=2, **changes)
     xla.sync = lambda **kwargs: None
     xla.manual_seed = lambda seed: None
     runtime.global_ordinal = lambda: rank
-    runtime.world_size = lambda: 2
+    runtime.world_size = lambda: 2 if parallel else 1
     runtime.device_type = lambda: "TPU"
     xm.REDUCE_MIN, xm.REDUCE_SUM = "min", "sum"
     xm.all_reduce, xm.reduce_gradients = all_reduce, reduce_gradients
-    xm.rendezvous = state.barriers.append
+    xm.rendezvous = rendezvous
     for module in (xla, core, xm, runtime):
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
@@ -295,7 +300,7 @@ def test_worker_rejects_dataset_without_complete_accumulation_window(monkeypatch
 
 
 def test_main_launches_workers_without_initializing_parent_device(monkeypatch):
-    train = _tpu_train()
+    train = _tpu_train(parallel=True)
     assert callable(getattr(train, "main", None)), "TPU launcher is not implemented"
     xla = ModuleType("torch_xla")
     launches = []
@@ -310,7 +315,7 @@ def test_main_launches_workers_without_initializing_parent_device(monkeypatch):
     assert launches == [(train._train_worker, (cfg,), "spawn")]
 
 
-def test_main_no_spawn_runs_worker_in_process(monkeypatch):
+def test_single_chip_main_runs_training_in_process(monkeypatch):
     train = _tpu_train()
     xla = ModuleType("torch_xla")
     launches = []
@@ -318,18 +323,18 @@ def test_main_no_spawn_runs_worker_in_process(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_xla", xla)
     monkeypatch.delenv("PJRT_DEVICE", raising=False)
     calls = []
-    monkeypatch.setattr(train, "_train_worker", lambda index, cfg: calls.append((index, cfg)))
+    monkeypatch.setattr(train, "_train", lambda cfg: calls.append(cfg))
     cfg = Config()
 
-    train.main(cfg, spawn=False)
+    train.main(cfg)
 
-    assert calls == [(0, cfg)]
+    assert calls == [cfg]
     assert launches == []
     assert os.environ["PJRT_DEVICE"] == "TPU"
 
 
 def test_main_clears_stale_tpu_sharding_overrides(monkeypatch):
-    train = _tpu_train()
+    train = _tpu_train(parallel=True)
     xla = ModuleType("torch_xla")
     launches = []
     xla.launch = lambda fn, args, start_method: launches.append((fn, args, start_method))
@@ -354,8 +359,62 @@ def test_main_clears_stale_tpu_sharding_overrides(monkeypatch):
         {"num_epochs": 0},
     ],
 )
-def test_main_rejects_invalid_training_sizes_before_launch(changes):
-    train = _tpu_train()
+@pytest.mark.parametrize("parallel", [False, True])
+def test_main_rejects_invalid_training_sizes_before_launch(changes, parallel):
+    train = _tpu_train(parallel=parallel)
     assert callable(getattr(train, "main", None)), "TPU launcher is not implemented"
     with pytest.raises(ValueError):
         train.main(Config(**changes))
+
+
+def test_single_chip_training_accumulates_without_collectives(monkeypatch):
+    train, cfg, state = _cpu_worker(monkeypatch, parallel=False, row_count=5, num_epochs=2)
+    train._train(cfg)
+
+    assert state.model.forward_calls == 8
+    assert [step for step, _ in state.logs] == [1, 2, 3, 4]
+    assert state.logs[0][1]["loss"] == pytest.approx(math.log(2))
+    assert state.logs[0][1]["grad_norm"] == pytest.approx(math.sqrt(50))
+    assert state.logs[1][1]["loss"] == pytest.approx(math.log1p(math.exp(-2)))
+    assert state.logs[-1][1]["learning_rate"] == 0.0
+
+
+def test_single_chip_sampling_needs_no_rendezvous(monkeypatch):
+    train, cfg, state = _cpu_worker(monkeypatch, parallel=False, sample_every=1)
+    train._train(cfg)
+
+    assert state.samples == [0, 1]
+    assert len(state.logs) == len(state.inits) == len(state.finishes) == 1
+
+
+def test_single_chip_nonfinite_loss_skips_update(monkeypatch):
+    train, cfg, state = _cpu_worker(monkeypatch, parallel=False)
+    monkeypatch.setattr(train, "compute_loss", lambda model, batch: torch.tensor(float("nan")))
+    train._train(cfg)
+
+    assert state.model.weights.detach().tolist() == [0.0, 0.0]
+    assert state.logs == []
+
+
+def test_single_chip_rejects_multiple_workers(monkeypatch):
+    train, cfg, _ = _cpu_worker(monkeypatch, parallel=False)
+    monkeypatch.setattr(sys.modules["torch_xla.runtime"], "world_size", lambda: 8)
+    with pytest.raises(ValueError, match="train_tpu_parallel"):
+        train._train(cfg)
+
+
+def test_single_chip_dataloader_keeps_static_full_batches(monkeypatch):
+    train = _tpu_train()
+    rows = [
+        {"input_ids": torch.tensor([i, i]), "labels": torch.tensor([-100, i])} for i in range(5)
+    ]
+    monkeypatch.setattr(train, "create_dataloader", lambda cfg, tokenizer: DataLoader(rows))
+    loader = train._create_tpu_dataloader(
+        Config(batch_size=2, max_length=6), SimpleNamespace(pad_token_id=0)
+    )
+    batches = list(loader)
+
+    assert len(batches) == 2
+    assert all(batch.input_ids.shape == (2, 6) for batch in batches)
+    assert len({int(row[0]) for batch in batches for row in batch.input_ids}) == 4
+    assert not isinstance(loader.sampler, DistributedSampler)
